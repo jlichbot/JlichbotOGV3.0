@@ -1,0 +1,7 @@
+[build]
+builder = "dockerfile"
+
+[deploy]
+# Every 5 minutes, 24/7 — crypto fast markets run around the clock
+cronSchedule = "*/5 * * * *"
+restartPolicyType = "never"
