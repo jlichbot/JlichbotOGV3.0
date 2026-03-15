@@ -305,43 +305,192 @@ def fetch_orderbook_summary(clob_token_ids):
 # Sprint Market Discovery
 # =============================================================================
 
+# Asset prefix mapping for Unix-timestamp slug format
+# e.g. btc-updown-5m-1773592800, eth-updown-5m-..., sol-updown-5m-...
+_ASSET_SLUG_PREFIX = {"BTC": "btc", "ETH": "eth", "SOL": "sol"}
+
+
+def _lookup_by_unix_slug(asset="BTC", window="5m"):
+    """
+    MOST RELIABLE method: fetch the live window by computing its Unix-timestamp slug.
+
+    Polymarket generates live market URLs as: {asset}-updown-{window}-{unix_ts}
+    where unix_ts = (int(time.time()) // window_secs) * window_secs
+
+    This never fails due to Simmer import lag or Gamma API filtering quirks
+    because we construct the exact URL of the currently-open market.
+    """
+    import time as _time
+    prefix      = _ASSET_SLUG_PREFIX.get(asset.upper(), "btc")
+    window_secs = _window_seconds.get(window, 300)
+    now_ts      = int(_time.time())
+    win_ts      = (now_ts // window_secs) * window_secs
+
+    markets = []
+    # Check current and previous window (catches the first seconds of a new window)
+    for ts in [win_ts, win_ts - window_secs]:
+        slug = f"{prefix}updown-{window}-{ts}"
+        url  = f"https://gamma-api.polymarket.com/markets?slug={slug}"
+        data = _api_request(url, timeout=8)
+        if not data or isinstance(data, dict):
+            continue
+        for m in data:
+            if m.get("closed", False):
+                continue
+            clob_tokens_raw = m.get("clobTokenIds", "[]")
+            if isinstance(clob_tokens_raw, str):
+                try:
+                    clob_tokens = json.loads(clob_tokens_raw)
+                except Exception:
+                    clob_tokens = []
+            else:
+                clob_tokens = clob_tokens_raw or []
+            # Use Unix timestamp for exact open/close times — no title parsing needed
+            opens_at = datetime.fromtimestamp(ts, tz=timezone.utc)
+            end_time = datetime.fromtimestamp(ts + window_secs, tz=timezone.utc)
+            markets.append({
+                "question":     m.get("question", slug),
+                "slug":         slug,
+                "condition_id": m.get("conditionId", ""),
+                "end_time":     end_time,
+                "opens_at":     opens_at,
+                "clob_token_ids": clob_tokens,
+                "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 1000),
+                "source":       "clob_direct",
+            })
+            print(f"  ✅ Live window via slug: {m.get('question', slug)}")
+            return markets  # Return on first hit
+    return markets
+
+
+def _gamma_current_window(asset="BTC", window="5m"):
+    """
+    Two-path live window discovery:
+    1. Unix slug lookup (primary — always works, guaranteed correct window)
+    2. endDateMin/endDateMax time query (fallback)
+    """
+    # Path 1: direct Unix timestamp slug — most reliable
+    direct = _lookup_by_unix_slug(asset, window)
+    if direct:
+        return direct
+
+    # Path 2: time-bounded Gamma query (fallback if slug lookup fails)
+    from urllib.parse import urlencode
+    now = datetime.now(timezone.utc)
+    window_secs = _window_seconds.get(window, 300)
+    end_min = now.strftime("%Y-%m-%dT%H:%M:%SZ")
+    end_max = (now + timedelta(seconds=window_secs + 60)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    patterns = ASSET_PATTERNS.get(asset, ASSET_PATTERNS["BTC"])
+
+    params = urlencode({
+        "limit": 10,
+        "closed": "false",
+        "tag": "crypto",
+        "endDateMin": end_min,
+        "endDateMax": end_max,
+    })
+    url = f"https://gamma-api.polymarket.com/markets?{params}"
+    result = _api_request(url, timeout=8)
+    if not result or isinstance(result, dict):
+        return []
+
+    markets = []
+    for m in result:
+        q = (m.get("question") or "").lower()
+        if not any(p in q for p in patterns):
+            continue
+        if m.get("closed", False):
+            continue
+        slug = m.get("slug", "")
+        if not slug:
+            continue
+        end_time = _parse_fast_market_end_time(m.get("question", ""))
+        if not end_time:
+            continue
+        clob_tokens_raw = m.get("clobTokenIds", "[]")
+        if isinstance(clob_tokens_raw, str):
+            try:
+                clob_tokens = json.loads(clob_tokens_raw)
+            except Exception:
+                clob_tokens = []
+        else:
+            clob_tokens = clob_tokens_raw or []
+        opens_at = end_time - timedelta(seconds=window_secs)
+        markets.append({
+            "question":     m.get("question", ""),
+            "slug":         slug,
+            "condition_id": m.get("conditionId", ""),
+            "end_time":     end_time,
+            "opens_at":     opens_at,
+            "clob_token_ids": clob_tokens,
+            "fee_rate_bps": int(m.get("fee_rate_bps") or m.get("feeRateBps") or 0),
+            "source":       "gamma_live",
+        })
+    return markets
+
+
 def discover_fast_market_markets(asset="BTC", window="5m"):
-    """Find active fast markets via Simmer API (pre-imported, reliable).
-    Falls back to Gamma API if Simmer returns no results."""
-    # Primary: Simmer's /api/sdk/fast-markets (markets already imported, is_live_now computed)
+    """Find active fast markets.
+    Strategy:
+      1. Query Gamma for markets expiring in the CURRENT window (live right now)
+      2. Query Simmer for pre-imported upcoming markets (used for signal + import)
+      3. Merge both — deduplicate by question title
+    """
+    now = datetime.now(timezone.utc)
+    window_secs = _window_seconds.get(window, 300)
+    all_markets = []
+    seen_questions = set()
+
+    # ── Step 1: Gamma current-window query (finds the live market NOW) ──────
+    try:
+        live_markets = _gamma_current_window(asset, window)
+        if live_markets:
+            print(f"  INFO: Gamma live query found {len(live_markets)} current-window market(s)")
+        for m in live_markets:
+            key = m["question"].lower()[:60]
+            if key not in seen_questions:
+                seen_questions.add(key)
+                all_markets.append(m)
+    except Exception as e:
+        print(f"  WARNING: Gamma live query failed ({e})")
+
+    # ── Step 2: Simmer pre-imported markets (upcoming windows) ───────────────
     try:
         client = get_client()
-        sdk_markets = client.get_fast_markets(asset=asset, window=window, limit=50)
+        sdk_markets = client.get_fast_markets(asset=asset, window=window, limit=100)
         if sdk_markets:
-            markets = []
+            simmer_count = 0
             for m in sdk_markets:
-                # Parse resolves_at string to datetime for time calculations
                 end_time = _parse_resolves_at(m.resolves_at) if m.resolves_at else None
+                opens_at = _parse_resolves_at(m.opens_at) if getattr(m, "opens_at", None) else None
                 clob_tokens = [m.polymarket_token_id] if m.polymarket_token_id else []
                 if m.polymarket_no_token_id:
                     clob_tokens.append(m.polymarket_no_token_id)
-                # Parse opens_at — Simmer provides this directly, use it for
-                # accurate live detection instead of relying on is_live_now flag
-                opens_at = _parse_resolves_at(m.opens_at) if getattr(m, "opens_at", None) else None
-                markets.append({
-                    "question": m.question,
-                    "market_id": m.id,
-                    "end_time": end_time,
-                    "opens_at": opens_at,
-                    "clob_token_ids": clob_tokens,
-                    "is_live_now": m.is_live_now,
-                    "spread_cents": m.spread_cents,
-                    "liquidity_tier": m.liquidity_tier,
-                    "external_price_yes": m.external_price_yes,
-                    "fee_rate_bps": getattr(m, "fee_rate_bps", 0),
-                    "source": "simmer",
-                })
-            return markets
+                key = (m.question or "").lower()[:60]
+                if key not in seen_questions:
+                    seen_questions.add(key)
+                    all_markets.append({
+                        "question":     m.question,
+                        "market_id":    m.id,
+                        "end_time":     end_time,
+                        "opens_at":     opens_at,
+                        "clob_token_ids": clob_tokens,
+                        "is_live_now":  m.is_live_now,
+                        "spread_cents": m.spread_cents,
+                        "liquidity_tier": m.liquidity_tier,
+                        "external_price_yes": m.external_price_yes,
+                        "fee_rate_bps": getattr(m, "fee_rate_bps", 0),
+                        "source":       "simmer",
+                    })
+                    simmer_count += 1
+            print(f"  INFO: Simmer added {simmer_count} upcoming markets")
     except Exception as e:
-        print(f"  ⚠️  Simmer fast-markets API failed ({e}), falling back to Gamma")
+        print(f"  WARNING: Simmer fast-markets API failed ({e}), using Gamma only")
+        if not all_markets:
+            # Full Gamma fallback
+            return _discover_via_gamma(asset, window)
 
-    # Fallback: Gamma API (may return stale data)
-    return _discover_via_gamma(asset, window)
+    return all_markets
 
 
 def _discover_via_gamma(asset="BTC", window="5m"):
@@ -794,6 +943,11 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     log(f"\n🔍 Discovering {ASSET} fast markets...")
     markets = discover_fast_market_markets(ASSET, WINDOW)
     log(f"  Found {len(markets)} active fast markets")
+    # Debug: show how many have opens_at and how many are currently live
+    now_utc = datetime.now(timezone.utc)
+    live_count = sum(1 for m in markets if m.get("opens_at") and m["opens_at"] <= now_utc)
+    with_opens = sum(1 for m in markets if m.get("opens_at"))
+    log(f"  opens_at available: {with_opens}/{len(markets)}  |  currently live: {live_count}")
 
     # Look up fee rate once per run from a sample token (same window = same fee tier)
     if markets:
@@ -815,16 +969,25 @@ def run_fast_market_strategy(dry_run=True, positions_only=False, show_config=Fal
     # Step 2: Find best fast_market to trade
     best = find_best_fast_market(markets)
     if not best:
-        # Show what we skipped so users understand the gap
         now = datetime.now(timezone.utc)
+        window_secs = _window_seconds.get(WINDOW, 300)
+        live_count = 0
         for m in markets:
             end_time = m.get("end_time")
-            if m.get("is_live_now") is False:
-                log(f"  Skipped: {m['question'][:50]}... (not live yet)")
-            elif end_time:
-                secs_left = (end_time - now).total_seconds()
-                log(f"  Skipped: {m['question'][:50]}... ({secs_left:.0f}s left < {MIN_TIME_REMAINING}s min)")
-        log(f"  No live tradeable markets among {len(markets)} found — waiting for next window")
+            if not end_time:
+                continue
+            remaining = (end_time - now).total_seconds()
+            opens_at  = m.get("opens_at")
+            start_time = opens_at if opens_at else end_time - timedelta(seconds=window_secs)
+            is_live   = start_time <= now
+            if is_live and remaining <= MIN_TIME_REMAINING:
+                log(f"  Skipped: {m['question'][:50]}... ({remaining:.0f}s left, too close to expiry)")
+            elif not is_live:
+                opens_in = (start_time - now).total_seconds()
+                log(f"  Skipped: {m['question'][:50]}... (opens in {opens_in:.0f}s)")
+            else:
+                live_count += 1
+        log(f"  No live tradeable markets among {len(markets)} found (live={live_count}, all future or expired)")
         if not quiet:
             print(f"📊 Summary: No tradeable markets (0/{len(markets)} live with enough time)")
         return
