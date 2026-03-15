@@ -320,16 +320,20 @@ def discover_fast_market_markets(asset="BTC", window="5m"):
                 clob_tokens = [m.polymarket_token_id] if m.polymarket_token_id else []
                 if m.polymarket_no_token_id:
                     clob_tokens.append(m.polymarket_no_token_id)
+                # Parse opens_at — Simmer provides this directly, use it for
+                # accurate live detection instead of relying on is_live_now flag
+                opens_at = _parse_resolves_at(m.opens_at) if getattr(m, "opens_at", None) else None
                 markets.append({
                     "question": m.question,
-                    "market_id": m.id,  # Already imported — no import step needed
+                    "market_id": m.id,
                     "end_time": end_time,
+                    "opens_at": opens_at,
                     "clob_token_ids": clob_tokens,
                     "is_live_now": m.is_live_now,
                     "spread_cents": m.spread_cents,
                     "liquidity_tier": m.liquidity_tier,
                     "external_price_yes": m.external_price_yes,
-                    "fee_rate_bps": getattr(m, 'fee_rate_bps', 0),  # Filled by dynamic lookup after discovery
+                    "fee_rate_bps": getattr(m, "fee_rate_bps", 0),
                     "source": "simmer",
                 })
             return markets
@@ -427,26 +431,26 @@ def find_best_fast_market(markets):
     max_remaining = _window_seconds.get(WINDOW, 300) * 2
     candidates = []
     for m in markets:
-        # Prefer is_live_now flag from Simmer API (reliable, server-computed)
-        if m.get("is_live_now") is not None:
-            if not m["is_live_now"]:
-                continue  # Not live yet — skip
-            end_time = m.get("end_time")
-            if end_time:
-                remaining = (end_time - now).total_seconds()
-                if remaining > MIN_TIME_REMAINING:
-                    candidates.append((remaining, m))
+        end_time = m.get("end_time")
+        if not end_time:
+            continue
+        remaining = (end_time - now).total_seconds()
+        if remaining <= MIN_TIME_REMAINING:
+            continue  # Too close to expiry
+
+        # Determine start_time — prefer opens_at from Simmer API (exact),
+        # fall back to computing from window duration (Gamma path)
+        opens_at = m.get("opens_at")
+        if opens_at:
+            start_time = opens_at
         else:
-            # Gamma fallback: compute start_time, check if now is inside the live window
-            # A market is live if: start_time <= now <= end_time - MIN_TIME_REMAINING
-            end_time = m.get("end_time")
-            if not end_time:
-                continue
-            remaining = (end_time - now).total_seconds()
             window_secs = _window_seconds.get(WINDOW, 300)
             start_time = end_time - timedelta(seconds=window_secs)
-            if start_time <= now and remaining > MIN_TIME_REMAINING:
-                candidates.append((remaining, m))
+
+        # Market is live if we are inside its trading window
+        if start_time <= now:
+            candidates.append((remaining, m))
+        # else: market opens in the future — skip
 
     if not candidates:
         return None
