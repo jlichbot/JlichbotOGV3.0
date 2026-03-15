@@ -329,7 +329,7 @@ def _lookup_by_unix_slug(asset="BTC", window="5m"):
     markets = []
     # Check current and previous window (catches the first seconds of a new window)
     for ts in [win_ts, win_ts - window_secs]:
-        slug = f"{prefix}updown-{window}-{ts}"
+        slug = f"{prefix}-updown-{window}-{ts}"
         url  = f"https://gamma-api.polymarket.com/markets?slug={slug}"
         data = _api_request(url, timeout=8)
         if not data or isinstance(data, dict):
